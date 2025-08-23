@@ -1,31 +1,48 @@
-# workflow name
 name: Android CI
 
-#Trigger events for the workflow
 on:
   push:
-    branches: [master]
-  pull_request: 
-    branches: [ master ] 
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
 
 jobs:
-  test_branches:
+  pull_push_branches:
     runs-on: ubuntu-latest
 
     steps:
-    # Step 1: Get the source code from the repository
-    - name: welcome message
-      run: |
-        echo "================================="
-        echo "   🚀 Build Started"
-        echo "   📦 Installing dependencies..."
-        echo "================================="
+      # Pretty header
+      - name: Welcome message
+        run: |
+          echo "================================="
+          echo "   🚀 Build Started"
+          echo "   📦 Installing dependencies..."
+          echo "================================="
 
-    # step2: chek out code
-    - name: checkour repository
-      uses: actions/checkout@v5.0.0
+      # Checkout source
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
+      # Set up JDK (Android Gradle Plugin needs 17+)
+      - name: Set up Java
+        uses: actions/setup-java@v5.0.0
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
 
-    - name: list all repo
-      run: ls -la
-    
+      # (Optional but recommended) Validate Gradle wrapper
+      - name: Validate Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v3
+
+      # Grant execute permission for Gradle wrapper
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      # Build & run unit tests (adjust module/tasks as needed)
+      - name: Build & Test
+        run: ./gradlew clean test assemble
+
+      # List repo contents (debug)
+      - name: List repository files
+        run: ls -la
