@@ -1,0 +1,602 @@
+# Complete Android CI/CD Pipeline with Firebase App Distribution
+# Pure GitHub Actions implementation - no Fastlane required
+name: Android CI/CD
+
+# Trigger conditions
+on:
+  # Automatic triggers based on branch pushes
+  push:
+    branches:
+      - main          # Production release builds
+      - develop       # Development debug builds
+      - staging       # Staging debug builds
+      - uat           # UAT debug builds
+
+  # Pull request validation (build but don't distribute)
+  pull_request:
+    branches: [main, develop, staging, uat]
+
+  # Manual trigger with full parameter control
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: 'Build flavor'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - uat
+          - prod
+          - internal
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+      distribution_groups:
+        description: 'Firebase distribution groups'
+        required: false
+        default: 'QC,Developers'
+      skip_tests:
+        description: 'Skip tests'
+        type: boolean
+        default: false
+      create_release:
+        description: 'Create GitHub release'
+        type: boolean
+        default: false
+
+# Global environment variables
+env:
+  FIREBASE_APP_ID: "1:750706326635:android:24b1dc5f1ba5d2ed85452e"
+  APP_NAME: ${{ vars.APP_NAME || 'Android App' }}
+
+jobs:
+  # Job 1: Setup and configuration
+  setup:
+    name: 🔧 Setup Configuration
+    runs-on: ubuntu-latest
+    outputs:
+      flavor: ${{ steps.config.outputs.flavor }}
+      build_type: ${{ steps.config.outputs.build_type }}
+      should_deploy: ${{ steps.config.outputs.should_deploy }}
+      distribution_groups: ${{ steps.config.outputs.distribution_groups }}
+      skip_tests: ${{ steps.config.outputs.skip_tests }}
+      create_release: ${{ steps.config.outputs.create_release }}
+      build_number: ${{ steps.build_number.outputs.build_number }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine build configuration
+        id: config
+        run: |
+          echo "🔍 Determining build configuration..."
+          
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            # Manual trigger
+            echo "📱 Manual trigger detected"
+            echo "flavor=${{ github.event.inputs.flavor }}" >> $GITHUB_OUTPUT
+            echo "build_type=${{ github.event.inputs.build_type }}" >> $GITHUB_OUTPUT
+            echo "distribution_groups=${{ github.event.inputs.distribution_groups }}" >> $GITHUB_OUTPUT
+            echo "skip_tests=${{ github.event.inputs.skip_tests }}" >> $GITHUB_OUTPUT
+            echo "create_release=${{ github.event.inputs.create_release }}" >> $GITHUB_OUTPUT
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" == "pull_request" ]; then
+            # PR - build but don't deploy
+            echo "🔄 Pull request trigger - build only"
+            echo "flavor=dev" >> $GITHUB_OUTPUT
+            echo "build_type=debug" >> $GITHUB_OUTPUT
+            echo "distribution_groups=" >> $GITHUB_OUTPUT
+            echo "skip_tests=false" >> $GITHUB_OUTPUT
+            echo "create_release=false" >> $GITHUB_OUTPUT
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+          else
+            # Branch-based automatic deployment
+            echo "🌿 Branch trigger: ${{ github.ref_name }}"
+            case "${{ github.ref_name }}" in
+              "main")
+                echo "flavor=prod" >> $GITHUB_OUTPUT
+                echo "build_type=release" >> $GITHUB_OUTPUT
+                echo "create_release=true" >> $GITHUB_OUTPUT
+                ;;
+              "staging")
+                echo "flavor=staging" >> $GITHUB_OUTPUT
+                echo "build_type=debug" >> $GITHUB_OUTPUT
+                echo "create_release=false" >> $GITHUB_OUTPUT
+                ;;
+              "uat")
+                echo "flavor=uat" >> $GITHUB_OUTPUT
+                echo "build_type=debug" >> $GITHUB_OUTPUT
+                echo "create_release=false" >> $GITHUB_OUTPUT
+                ;;
+              "develop")
+                echo "flavor=dev" >> $GITHUB_OUTPUT
+                echo "build_type=debug" >> $GITHUB_OUTPUT
+                echo "create_release=false" >> $GITHUB_OUTPUT
+                ;;
+              *)
+                echo "flavor=dev" >> $GITHUB_OUTPUT
+                echo "build_type=debug" >> $GITHUB_OUTPUT
+                echo "create_release=false" >> $GITHUB_OUTPUT
+                echo "should_deploy=false" >> $GITHUB_OUTPUT
+                ;;
+            esac
+          
+            # Set defaults for automatic triggers
+            if [ -z "$(echo '${{ github.ref_name }}' | grep -E '^(main|staging|uat|develop)$')" ]; then
+              echo "should_deploy=false" >> $GITHUB_OUTPUT
+            else
+              echo "should_deploy=true" >> $GITHUB_OUTPUT
+            fi
+            echo "distribution_groups=QC,Developers" >> $GITHUB_OUTPUT
+            echo "skip_tests=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate build number
+        id: build_number
+        run: |
+          # Generate unique build number from timestamp and run number
+          BUILD_NUMBER=$(date '+%Y%m%d%H%M%S')
+          echo "build_number=$BUILD_NUMBER" >> $GITHUB_OUTPUT
+          echo "📊 Generated build number: $BUILD_NUMBER"
+
+  # Job 2: Run tests and code quality checks
+  test:
+    name: 🧪 Test & Code Quality
+    runs-on: ubuntu-latest
+    needs: setup
+    if: needs.setup.outputs.skip_tests == 'false'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: ${{ runner.os }}-gradle-
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Run unit tests
+        run: ./gradlew test --stacktrace --continue
+
+      - name: Run lint checks
+        run: ./gradlew lint --stacktrace --continue
+
+      - name: Generate test reports
+        if: always()
+        run: |
+          # Create combined test report
+          mkdir -p build/reports/combined
+          find . -name "TEST-*.xml" -exec cp {} build/reports/combined/ \;
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            **/build/reports/tests/
+            **/build/test-results/
+            **/build/reports/lint-results*.html
+          retention-days: 30
+
+  # Job 3: Build APK/AAB
+  build:
+    name: 🏗️ Build App
+    runs-on: ubuntu-latest
+    needs: [setup, test]
+    if: always() && needs.setup.result == 'success' && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    outputs:
+      apk_path: ${{ steps.build.outputs.apk_path }}
+      aab_path: ${{ steps.build.outputs.aab_path }}
+      version_name: ${{ steps.version.outputs.version_name }}
+      version_code: ${{ steps.version.outputs.version_code }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: ${{ runner.os }}-gradle-
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Decode keystore
+        if: needs.setup.outputs.build_type == 'release'
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > app/keystore.jks
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+
+      - name: Get and update version
+        id: version
+        run: |
+          # Get current version from build.gradle.kts
+          VERSION_NAME=$(grep -oP 'versionName\s*=\s*"\K[^"]*' app/build.gradle.kts || echo "1.0.0")
+          CURRENT_VERSION_CODE=$(grep -oP 'versionCode\s*=\s*\K[0-9]*' app/build.gradle.kts || echo "1")
+          
+          # Generate new version code using build number
+          NEW_VERSION_CODE="${{ needs.setup.outputs.build_number }}"
+          
+          # Update version code in build.gradle.kts
+          sed -i "s/versionCode\s*=\s*[0-9]*/versionCode = $NEW_VERSION_CODE/" app/build.gradle.kts
+          
+          echo "version_name=$VERSION_NAME" >> $GITHUB_OUTPUT
+          echo "version_code=$NEW_VERSION_CODE" >> $GITHUB_OUTPUT
+          echo "📱 Version: $VERSION_NAME ($NEW_VERSION_CODE)"
+
+      - name: Build APK and AAB
+        id: build
+        run: |
+          FLAVOR="${{ needs.setup.outputs.flavor }}"
+          BUILD_TYPE="${{ needs.setup.outputs.build_type }}"
+          
+          # Capitalize for Gradle tasks
+          FLAVOR_CAP=$(echo "$FLAVOR" | awk '{print toupper(substr($0,1,1))tolower(substr($0,2))}')
+          BUILD_TYPE_CAP=$(echo "$BUILD_TYPE" | awk '{print toupper(substr($0,1,1))tolower(substr($0,2))}')
+          
+          echo "🏗️ Building $FLAVOR_CAP$BUILD_TYPE_CAP..."
+          
+          # Build APK
+          ./gradlew assemble${FLAVOR_CAP}${BUILD_TYPE_CAP} --stacktrace
+          
+          # Build AAB for release builds
+          if [ "$BUILD_TYPE" == "release" ]; then
+            ./gradlew bundle${FLAVOR_CAP}${BUILD_TYPE_CAP} --stacktrace
+          fi
+          
+          # Find built files
+          APK_PATH=$(find app/build/outputs/apk -name "*${FLAVOR}*${BUILD_TYPE}*.apk" | head -1)
+          AAB_PATH=""
+          if [ "$BUILD_TYPE" == "release" ]; then
+            AAB_PATH=$(find app/build/outputs/bundle -name "*${FLAVOR}*${BUILD_TYPE}*.aab" | head -1)
+          fi
+          
+          if [ -z "$APK_PATH" ] || [ ! -f "$APK_PATH" ]; then
+            echo "❌ APK build failed"
+            find app/build/outputs -name "*.apk" -ls
+            exit 1
+          fi
+          
+          echo "apk_path=$APK_PATH" >> $GITHUB_OUTPUT
+          echo "aab_path=$AAB_PATH" >> $GITHUB_OUTPUT
+          echo "✅ Build successful:"
+          echo "   APK: $APK_PATH"
+          if [ -n "$AAB_PATH" ]; then
+            echo "   AAB: $AAB_PATH"
+          fi
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts-${{ needs.setup.outputs.flavor }}-${{ needs.setup.outputs.build_type }}
+          path: |
+            ${{ steps.build.outputs.apk_path }}
+            ${{ steps.build.outputs.aab_path }}
+          retention-days: 30
+
+  # Job 4: Firebase App Distribution
+  distribute_firebase:
+    name: 🚀 Firebase Distribution
+    runs-on: ubuntu-latest
+    needs: [setup, build]
+    if: needs.setup.outputs.should_deploy == 'true' && needs.build.result == 'success'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts-${{ needs.setup.outputs.flavor }}-${{ needs.setup.outputs.build_type }}
+          path: ./artifacts/
+
+      - name: Install Firebase CLI
+        run: npm install -g firebase-tools
+
+      - name: Create release notes
+        id: release_notes
+        run: |
+          echo "📝 Creating release notes..."
+          
+          # Check for release_notes file
+          if [ -f "./release_notes" ]; then
+            NOTES=$(cat ./release_notes)
+          else
+            # Generate from commits
+            NOTES="🚀 Recent Changes:\n$(git log --pretty=format:'• %s (%an)' --since='7 days ago' | head -10)"
+          fi
+          
+          # Get build type icon
+          case "${{ needs.setup.outputs.build_type }}" in
+            "debug") ICON="🛠️" ;;
+            "release") ICON="🚀" ;;
+            *) ICON="📱" ;;
+          esac
+          
+          # Create formatted release notes
+          cat > release_notes_formatted.txt << EOF
+  $ICON ${{ needs.setup.outputs.build_type }}-${{ needs.build.outputs.version_name }}
+  
+  ${{ env.APP_NAME }} - ${{ needs.setup.outputs.flavor }}
+
+Branch: ${{ github.ref_name }}
+Commit: ${{ github.sha }}
+  
+  $NOTES
+  EOF
+  
+  echo "✅ Release notes created"
+  
+  - name: Distribute to Firebase
+run: |
+  echo "🚀 Distributing to Firebase App Distribution..."
+  
+  # Set up Firebase auth
+  echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}' > firebase-service-account.json
+  export GOOGLE_APPLICATION_CREDENTIALS=firebase-service-account.json
+  
+  # Find APK file
+  APK_FILE=$(find ./artifacts -name "*.apk" | head -1)
+  
+  if [ -z "$APK_FILE" ] || [ ! -f "$APK_FILE" ]; then
+    echo "❌ APK file not found"
+    find ./artifacts -ls
+    exit 1
+  fi
+  
+  echo "📦 Distributing: $APK_FILE"
+  echo "👥 Groups: ${{ needs.setup.outputs.distribution_groups }}"
+  
+  # Distribute to Firebase
+  firebase appdistribution:distribute "$APK_FILE" \
+    --app "${{ env.FIREBASE_APP_ID }}" \
+    --groups "${{ needs.setup.outputs.distribution_groups }}" \
+    --release-notes-file release_notes_formatted.txt
+  
+  echo "✅ Firebase distribution completed"
+  
+  # Cleanup
+  rm -f firebase-service-account.json
+
+# Job 5: Create GitHub Release
+github_release:
+  name: 📦 GitHub Release
+  runs-on: ubuntu-latest
+  needs: [setup, build, distribute_firebase]
+  if: needs.setup.outputs.create_release == 'true' && needs.build.result == 'success'
+
+  steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: build-artifacts-${{ needs.setup.outputs.flavor }}-${{ needs.setup.outputs.build_type }}
+        path: ./artifacts/
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ needs.build.outputs.version_name }}-${{ needs.build.outputs.version_code }}
+        name: Release ${{ needs.build.outputs.version_name }} (${{ needs.build.outputs.version_code }})
+        body: |
+          ## 🚀 Release ${{ needs.build.outputs.version_name }}
+          
+          **Build Info:**
+          - Flavor: ${{ needs.setup.outputs.flavor }}
+          - Build Type: ${{ needs.setup.outputs.build_type }}
+          - Version Code: ${{ needs.build.outputs.version_code }}
+          - Branch: ${{ github.ref_name }}
+          - Commit: ${{ github.sha }}
+          
+          **Files:**
+          - APK: Android Application Package
+          - AAB: Android App Bundle (for Play Store)
+          
+          ---
+          Generated automatically by GitHub Actions
+        files: |
+          ./artifacts/*.apk
+          ./artifacts/*.aab
+        draft: false
+        prerelease: ${{ needs.setup.outputs.build_type == 'debug' }}
+
+# Job 6: Notifications
+notify:
+  name: 📢 Send Notifications
+  runs-on: ubuntu-latest
+  needs: [setup, build, distribute_firebase]
+  if: always() && needs.setup.outputs.should_deploy == 'true'
+
+  steps:
+    - name: Send Slack success notification
+      if: needs.distribute_firebase.result == 'success' && secrets.SLACK_WEBHOOK_URL != ''
+      uses: 8398a7/action-slack@v3
+      with:
+        status: success
+        custom_payload: |
+          {
+            "text": "🎉 Android App Successfully Deployed",
+            "attachments": [{
+              "color": "good",
+              "fields": [
+                {
+                  "title": "App",
+                  "value": "${{ env.APP_NAME }} v${{ needs.build.outputs.version_name }}-${{ needs.setup.outputs.flavor }}-${{ needs.setup.outputs.build_type }}",
+                  "short": false
+                },
+                {
+                  "title": "Version Code",
+                  "value": "${{ needs.build.outputs.version_code }}",
+                  "short": true
+                },
+                {
+                  "title": "Branch",
+                  "value": "${{ github.ref_name }}",
+                  "short": true
+                },
+                {
+                  "title": "Distribution Groups",
+                  "value": "${{ needs.setup.outputs.distribution_groups }}",
+                  "short": true
+                },
+                {
+                  "title": "Trigger",
+                  "value": "${{ github.event_name }}",
+                  "short": true
+                },
+                {
+                  "title": "Firebase App Distribution",
+                  "value": "✅ Deployed successfully",
+                  "short": false
+                }
+              ]
+            }]
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+    - name: Send Slack failure notification
+      if: needs.distribute_firebase.result == 'failure' && secrets.SLACK_WEBHOOK_URL != ''
+      uses: 8398a7/action-slack@v3
+      with:
+        status: failure
+        custom_payload: |
+          {
+            "text": "❌ Android App Deployment Failed",
+            "attachments": [{
+              "color": "danger",
+              "fields": [
+                {
+                  "title": "Configuration",
+                  "value": "${{ needs.setup.outputs.flavor }}-${{ needs.setup.outputs.build_type }}",
+                  "short": true
+                },
+                {
+                  "title": "Branch",
+                  "value": "${{ github.ref_name }}",
+                  "short": true
+                },
+                {
+                  "title": "Build Status",
+                  "value": "${{ needs.build.result }}",
+                  "short": true
+                },
+                {
+                  "title": "Distribution Status", 
+                  "value": "${{ needs.distribute_firebase.result }}",
+                  "short": true
+                },
+                {
+                  "title": "Action",
+                  "value": "<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Logs>",
+                  "short": false
+                }
+              ]
+            }]
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+# Job 7: Summary
+summary:
+  name: 📊 Pipeline Summary
+  runs-on: ubuntu-latest
+  needs: [setup, test, build, distribute_firebase, github_release]
+  if: always()
+
+  steps:
+    - name: Print pipeline summary
+      run: |
+        echo "🏁 Android CI/CD Pipeline Summary"
+        echo "=================================="
+        echo ""
+        echo "📋 Configuration:"
+        echo "  Flavor: ${{ needs.setup.outputs.flavor }}"
+        echo "  Build Type: ${{ needs.setup.outputs.build_type }}"
+        echo "  Should Deploy: ${{ needs.setup.outputs.should_deploy }}"
+        echo "  Skip Tests: ${{ needs.setup.outputs.skip_tests }}"
+        echo "  Create Release: ${{ needs.setup.outputs.create_release }}"
+        echo ""
+        echo "📊 Job Results:"
+        echo "  Setup: ${{ needs.setup.result }}"
+        echo "  Tests: ${{ needs.test.result || 'skipped' }}"
+        echo "  Build: ${{ needs.build.result || 'skipped' }}"
+        echo "  Firebase Distribution: ${{ needs.distribute_firebase.result || 'skipped' }}"
+        echo "  GitHub Release: ${{ needs.github_release.result || 'skipped' }}"
+        echo ""
+        
+        if [ "${{ needs.distribute_firebase.result }}" == "success" ]; then
+          echo "✅ SUCCESS: App built and distributed successfully!"
+          if [ "${{ needs.setup.outputs.should_deploy }}" == "true" ]; then
+            echo "🚀 Firebase App Distribution: Deployed to ${{ needs.setup.outputs.distribution_groups }}"
+          fi
+          if [ "${{ needs.github_release.result }}" == "success" ]; then
+            echo "📦 GitHub Release: Created successfully"
+          fi
+        elif [ "${{ needs.setup.outputs.should_deploy }}" == "false" ]; then
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "ℹ️  PR BUILD: App built successfully (no deployment for PRs)"
+          else
+            echo "ℹ️  BRANCH BUILD: App built successfully (branch not configured for deployment)"
+          fi
+        elif [ "${{ needs.build.result }}" == "failure" ]; then
+          echo "❌ FAILURE: Build failed"
+        elif [ "${{ needs.distribute_firebase.result }}" == "failure" ]; then
+          echo "❌ FAILURE: Firebase distribution failed"
+        else
+          echo "❓ Status unclear - check individual job results above"
+        fi
+        
+        echo ""
+        echo "🔗 Useful Links:"
+        echo "  Workflow Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        if [ "${{ needs.build.result }}" == "success" ]; then
+          echo "  Build Artifacts: Available for download in the workflow run"
+        fi
