@@ -14,8 +14,12 @@ jobs:
 
     steps:
     # Step 1: Get the source code from the repository
-    - name: welcome message 
-      run: echo "ahmed aly love lolo"
+    - name: welcome message
+      run: |
+        echo "================================="
+        echo "   🚀 Build Started"
+        echo "   📦 Installing dependencies..."
+        echo "================================="
 
     # step2: chek out code
     - name: checkour repository
