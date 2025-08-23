@@ -1,0 +1,27 @@
+# workflow name
+name: Android CI
+
+#Trigger events for the workflow
+on:
+  push:
+    branches: [master]
+  pull_request: 
+    branches: [ master ] 
+
+jobs:
+  test_branches:
+    runs-on: ubuntu-latest
+
+    steps:
+    # Step 1: Get the source code from the repository
+    - name: welcome message 
+      run: echo "ahmed aly love lolo"
+
+    # step2: chek out code
+    - name: checkour repository
+      uses: actions/checkout@v5.0.0
+
+
+    - name: list all repo
+      run: ls -la
+    
