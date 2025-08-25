@@ -1,53 +1,119 @@
-# .github/workflows/manual-trigger.yml
-name: Manual Android Trigger
+name: Android Firebase Distribute
 
 on:
   workflow_dispatch:
     inputs:
-      buildType:
-        description: 'Type of build'
+      lane:
+        description: "Fastlane lane (e.g., firebase_distribute_debug, firebase_distribute_release, firebase_distribute_debug_staging, firebase_distribute_debug_uat, firebase_distribute_internal, firebase_distribute_release_debug)"
         required: true
-        default: 'debug'
-        type: choice
-        options:
-          - debug
-          - release
+        default: "firebase_distribute_debug"
+      flavor:
+        description: "Product flavor (e.g., dev, staging, uat, internal, prod)"
+        required: true
+        default: "dev"
+      release_notes:
+        description: "Optional release notes override (otherwise uses ./release_notes)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  build-and-distribute:
     runs-on: ubuntu-latest
 
+    env:
+      # Java/Gradle
+      JAVA_VERSION: "17"
+      # App / Fastlane env consumed by your Fastfile
+      APP_NAME: ${{ vars.APP_NAME || 'SuperShiftCustomer' }}
+      PACKAGE_NAME: ${{ vars.PACKAGE_NAME || 'com.innovitics.app.shift' }}
+      FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
+      SLACK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      # Where we'll write the service account file on the runner
+      FIREBASE_SERVICE_JSON_PATH: ${{ github.workspace }}/fastlane/firebase-service-account.json
+      # Optional: pass FLAVOR and other toggles for your lanes
+      FLAVOR: ${{ github.event.inputs.flavor }}
+
     steps:
-      # Checkout repo
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # Set up JDK for Gradle/Android
-      - name: Set up Java
+      - name: Set up JDK
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: ${{ env.JAVA_VERSION }}
           cache: gradle
 
-      # Make gradlew executable
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
 
-      # Run build based on input
-      - name: Build APK
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          bundler-cache: true
+          cache-version: 1
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Decrypt / write Firebase service account
         run: |
-          if [ "${{ github.event.inputs.buildType }}" == "release" ]; then
-            ./gradlew assembleRelease
+          mkdir -p fastlane
+          echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}' > "${FIREBASE_SERVICE_JSON_PATH}"
+          # Basic sanity check
+          test -s "${FIREBASE_SERVICE_JSON_PATH}"
+
+      - name: Ensure release notes file
+        if: ${{ github.event.inputs.release_notes != '' }}
+        run: |
+          echo "${{ github.event.inputs.release_notes }}" > ./release_notes
+
+      - name: Install gems (if no Gemfile, install fastlane globally)
+        run: |
+          if [ -f Gemfile ]; then
+            bundle install --path vendor/bundle
           else
-            ./gradlew assembleDebug
+            sudo gem install fastlane -NV
           fi
 
-      # Upload APK artifact (optional)
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: app-${{ github.event.inputs.buildType }}-apk
-          path: app/build/outputs/apk/${{ github.event.inputs.buildType }}/*.apk
+      - name: Show Fastlane environment
+        run: |
+          fastlane --version
+          bundle exec fastlane --version || true
+          echo "Lane: ${{ github.event.inputs.lane }}"
+          echo "Flavor: ${{ github.event.inputs.flavor }}"
 
+      # If your project needs Android keystore signing for release builds,
+      # uncomment and adapt this block:
+      #
+      # - name: Prepare signing keystore
+      #   if: ${{ contains(github.event.inputs.lane, 'release') }}
+      #   run: |
+      #     echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > app/keystore.jks
+      #   env:
+      #     ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
 
+      - name: Run fastlane
+        env:
+          # Typical signing/env secrets (add these if your Gradle expects them)
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          # Prefer Bundler if present
+          if [ -f Gemfile ]; then
+            bundle exec fastlane android ${{ github.event.inputs.lane }} flavor:${{ github.event.inputs.flavor }}
+          else
+            fastlane android ${{ github.event.inputs.lane }} flavor:${{ github.event.inputs.flavor }}
+          fi

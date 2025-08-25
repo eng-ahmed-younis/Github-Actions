@@ -1,126 +1,69 @@
-name: Android Firebase Distribute (Fastlane)
+name: Android • Build & Firebase Distribute
 
 on:
-  # Manual trigger with full input controls
   workflow_dispatch:
     inputs:
-      buildType:
-        description: "Build type / lane to run"
-        required: true
-        default: "Debug"
+      build_type:
+        description: "Build type"
         type: choice
-        options: ["Debug", "Release"]
-
-      # Comma-separated flavors (e.g. CoreApp,FoxApp,MaxApp).
-      # If blank, you can also pass a single FLAVOR below.
-      flavors:
-        description: "Comma-separated flavors (e.g. CoreApp,FoxApp,MaxApp)"
-        required: false
-        default: "CoreApp,FoxApp,MaxApp"
-        type: string
-
-      # Optional: single flavor override. If set, it will be used instead of 'flavors'
+        required: true
+        default: "debug"
+        options:
+          - debug
+          - release
       flavor:
-        description: "Single flavor override (e.g. CoreApp)"
+        description: "Product flavor"
+        type: choice
+        required: true
+        default: "dev"
+        options:
+          - dev
+          - staging
+          - uat
+          - internal
+          - prod
+      release_notes:
+        description: "Optional release notes (else uses ./release_notes if present, or a default)"
+        type: string
         required: false
         default: ""
-        type: string
-
-      # Optional: custom release notes file path
-      releaseNotesPath:
-        description: "Path to release notes file"
-        required: false
-        default: "release_notes"
-        type: string
 
 permissions:
   contents: read
 
-# Make parallel runs for the same ref & buildType not step on each other
-concurrency:
-  group: fastlane-firebase-${{ github.ref }}-${{ inputs.buildType }}
-  cancel-in-progress: false
-
 jobs:
-  # 1) Plan: generate a JSON matrix from inputs.flavors or inputs.flavor
-  plan:
-    name: Plan flavor matrix
+  build-and-upload:
     runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.compute.outputs.matrix }}
-      lane: ${{ steps.compute.outputs.lane }}
-    steps:
-      - name: Compute matrix and lane
-        id: compute
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # Decide lane from buildType
-          if [[ "${{ inputs.buildType }}" == "Debug" ]]; then
-            LANE="firebase_distribute_debug"
-          else
-            LANE="firebase_distribute_release"
-          fi
-
-          # Prefer single 'flavor' if provided, else split 'flavors'
-          if [[ -n "${{ inputs.flavor }}" ]]; then
-            FLAVORS_JSON=$(jq -c -n --arg f "${{ inputs.flavor }}" '{include: [$f]}')
-          else
-            # Normalize commas + strip spaces
-            RAW="${{ inputs.flavors }}"
-            CLEAN="$(echo "$RAW" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | sed '/^$/d')"
-            # Build JSON array
-            mapfile -t ARR <<< "$CLEAN"
-            # shellcheck disable=SC2145
-            FLAVORS_JSON=$(jq -c -n --argjson a "$(printf '%s\n' "${ARR[@]}" | jq -R . | jq -s .)" '{include: $a}')
-          fi
-
-          echo "Selected lane: $LANE"
-          echo "Flavor matrix: $FLAVORS_JSON"
-
-          echo "lane=$LANE" >> "$GITHUB_OUTPUT"
-          echo "matrix=$FLAVORS_JSON" >> "$GITHUB_OUTPUT"
-
-  # 2) Build & Distribute: runs once per flavor (parallel)
-  distribute:
-    name: Distribute (${{ matrix.flavor }}) — ${{ needs.plan.outputs.lane }}
-    needs: plan
-    runs-on: ubuntu-latest
-
-    # Build one flavor per parallel job
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.plan.outputs.matrix).include }}
-      # matrix items will have 'flavor'
-
     env:
-      # ---- App/CI environment (safe names here; actual secrets in repo settings) ----
-      APP_NAME: ${{ vars.APP_NAME }}        # Or hardcode if you prefer; but vars let you change w/o code
-      FLAVORS: ${{ inputs.flavors }}        # For your helper that splits FLAVORS (Fastlane reads ENV)
-      FLAVOR: ${{ matrix.flavor }}          # Single flavor for this job (Fastlane also checks this)
-      SLACK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}          # Store your Slack Incoming Webhook as a secret
-      FIREBASE_CLI_TOKEN: ${{ secrets.FIREBASE_CLI_TOKEN }}# Store Firebase token as a secret
-      RELEASE_NOTES_PATH: ${{ inputs.releaseNotesPath }}   # Path used by your lane helpers if needed
+      JAVA_VERSION: "17"
 
-      # Optional: tune Gradle
-      GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.jvmargs="-Xmx3g -Dfile.encoding=UTF-8"
+      # Optional non-secret defaults (you can also set these under Actions → Variables)
+      APP_NAME: ${{ vars.APP_NAME || 'SuperShiftCustomer' }}
+
+      # Inputs
+      BUILD_TYPE: ${{ github.event.inputs.build_type }}
+      FLAVOR: ${{ github.event.inputs.flavor }}
+
+      # Firebase
+      FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}                  # e.g. 1:...:android:...
+      FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+      GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/.service-account.json
+
+      # Slack
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # -------- Java & Android toolchain --------
-      - name: Set up Java 17 (Temurin)
+      - name: Set up JDK
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: ${{ env.JAVA_VERSION }}
           cache: gradle
 
-      # Optional: Ensure Android SDK components are present.
-      # Gradle can auto-download most, but this speeds up first runs.
-      - name: Set up Android SDK (optional)
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
       - name: Cache Gradle
@@ -129,52 +72,112 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', 'gradle/libs.versions.toml') }}
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
           restore-keys: |
-            gradle-${{ runner.os }}-
+            ${{ runner.os }}-gradle-
 
-      # -------- Ruby & Fastlane --------
-      - name: Set up Ruby
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: "3.2"
-          bundler-cache: true # If you have Gemfile+Gemfile.lock
-
-      - name: Install Fastlane (no Gemfile)
-        if: ${{ !hashFiles('Gemfile') }}
+      - name: Install tools (jq + Firebase CLI)
         run: |
-          gem install fastlane --no-document
-          # If you use any specific plugins, you can install them here:
-          # fastlane add_plugin firebase_app_distribution
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+          npm install -g firebase-tools@latest
 
-      # If you maintain a Gemfile with fastlane + plugins, the bundler-cache step above installs them.
-      # In that case, use `bundle exec fastlane ...` instead of `fastlane ...`.
-
-      - name: Show selected settings
+      - name: Write Firebase service account
         run: |
-          echo "Flavor        : $FLAVOR"
-          echo "FLAVORS (raw) : $FLAVORS"
-          echo "Lane          : ${{ needs.plan.outputs.lane }}"
-          echo "APP_NAME      : $APP_NAME"
-          echo "Release notes : $RELEASE_NOTES_PATH"
+          echo "${FIREBASE_SERVICE_ACCOUNT_JSON}" > "${GOOGLE_APPLICATION_CREDENTIALS}"
+          test -s "${GOOGLE_APPLICATION_CREDENTIALS}"
 
-      # -------- Run your Fastlane lane --------
-      - name: Run Fastlane lane (Debug/Release)
+      - name: Ensure release notes file
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.inputs.release_notes }}" != "" ]; then
+            # Use the input to create/overwrite release_notes
+            printf "%s" "${{ github.event.inputs.release_notes }}" > ./release_notes
+          elif [ ! -f ./release_notes ]; then
+            # Create a sensible default if no file exists
+            echo "${APP_NAME} ${FLAVOR}-${BUILD_TYPE}" > ./release_notes
+          fi
+          echo "===== release_notes ====="
+          cat ./release_notes || true
+          echo "========================="
+
+      - name: Assemble APK/AAB
+        run: |
+          set -euo pipefail
+          # Build task: assemble<Flavor><BuildType> (e.g., assembleDevDebug)
+          FLAVOR_CAMEL="$(echo ${FLAVOR^})"
+          BUILD_CAMEL="$(echo ${BUILD_TYPE^})"
+          TASK="assemble${FLAVOR_CAMEL}${BUILD_CAMEL}"
+          echo "Running Gradle task: ${TASK}"
+          ./gradlew --no-daemon --stacktrace ${TASK}
+
+      - name: Distribute to Firebase App Distribution
         env:
-          # Any extra env your Fastlane reads can go here
-          # e.g. ANDROID_HOME, GOOGLE_APPLICATION_CREDENTIALS, etc. if needed
-          CI: "true"
+          # Change to your tester groups or provide testers via --testers
+          FAD_GROUPS: "QC,Developers"
         run: |
-          chmod +x gradlew
-          # Use bundle exec if you have a Gemfile; otherwise plain fastlane
-          fastlane android ${{ needs.plan.outputs.lane }}
+          set -euo pipefail
+          OUTDIR="app/build/outputs"
+          # Try to find the variant artifact (.apk or .aab) named *<flavor>-<build_type>*
+          ARTIFACT=$(find "${OUTDIR}" -type f \( -name "*${FLAVOR}-${BUILD_TYPE}.apk" -o -name "*${FLAVOR}-${BUILD_TYPE}.aab" \) | head -n 1)
+          if [ -z "$ARTIFACT" ]; then
+            echo "No artifact found for variant ${FLAVOR}-${BUILD_TYPE}" >&2
+            echo "Available files under ${OUTDIR}:"
+            find "${OUTDIR}" -type f | sed 's/^/ - /'
+            exit 1
+          fi
 
-      # -------- Artifacts (optional) --------
-      - name: Upload artifacts (APK/AAB)
+          echo "Distributing ${ARTIFACT} to Firebase App Distribution..."
+          # firebase-tools authenticates via GOOGLE_APPLICATION_CREDENTIALS automatically
+          firebase appdistribution:distribute "${ARTIFACT}" \
+            --app "${FIREBASE_APP_ID}" \
+            --release-notes-file ./release_notes \
+            --groups "${FAD_GROUPS}" \
+            --debug
+
+      - name: Notify Slack (title + release notes)
+        if: always()
+        run: |
+          set -euo pipefail
+
+          # Extract best-effort versionName/versionCode from gradle files
+          VERSION_NAME="unknown"
+          VERSION_CODE="unknown"
+          if [ -f app/build.gradle.kts ]; then
+            VN=$(grep -E 'versionName\s*=\s*"' app/build.gradle.kts | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+            VC=$(grep -E 'versionCode\s*=' app/build.gradle.kts | head -n1 | sed -E 's/.*=\s*([0-9]+).*/\1/')
+            [ -n "$VN" ] && VERSION_NAME="$VN"
+            [ -n "$VC" ] && VERSION_CODE="$VC"
+          elif [ -f app/build.gradle ]; then
+            VN=$(grep -E 'versionName' app/build.gradle | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+            VC=$(grep -E 'versionCode' app/build.gradle | head -n1 | sed -E 's/.*\s([0-9]+).*/\1/')
+            [ -n "$VN" ] && VERSION_NAME="$VN"
+            [ -n "$VC" ] && VERSION_CODE="$VC"
+          fi
+
+          ICON="🛠️"
+          if [ "${BUILD_TYPE}" = "release" ]; then ICON="🚀"; fi
+          if [ "${FLAVOR}" = "staging" ]; then ICON="🔍"; fi
+          if [ "${FLAVOR}" = "uat" ]; then ICON="🧪"; fi
+          if [ "${FLAVOR}" = "internal" ]; then ICON="🔒"; fi
+
+          TITLE="${ICON} #AndroidApp ${APP_NAME} v${VERSION_NAME}-${FLAVOR}-${BUILD_TYPE} (${VERSION_CODE})"
+          NOTES="$(cat ./release_notes || echo '')"
+
+          # Slack payload with message + release notes as an attachment
+          PAYLOAD=$(jq -n \
+            --arg text "$TITLE" \
+            --arg notes "$NOTES" \
+            '{text:$text, attachments:[{text:$notes}]}' )
+
+          curl -sS -X POST -H 'Content-type: application/json' \
+            --data "$PAYLOAD" \
+            "${SLACK_WEBHOOK_URL}" || true
+
+      - name: Upload outputs (artifact)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.flavor }}-${{ inputs.buildType }}-artifacts
-          path: |
-            **/outputs/apk/${{ inputs.buildType }}/**/*.apk
-            **/outputs/bundle/${{ inputs.buildType }}/**/*.aab
-          if-no-files-found: warn
+          name: android-outputs-${{ github.run_id }}
+          path: app/build/outputs/**
+          if-no-files-found: ignore
