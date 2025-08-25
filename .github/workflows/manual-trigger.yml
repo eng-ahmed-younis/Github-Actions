@@ -1,0 +1,53 @@
+# .github/workflows/manual-trigger.yml
+name: Manual Android (full-inputs demo)
+
+on:
+  workflow_dispatch:
+    inputs:
+      buildType:
+        description: 'Type of build'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Checkout repo
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Set up JDK for Gradle/Android
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      # Make gradlew executable
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      # Run build based on input
+      - name: Build APK
+        run: |
+          if [ "${{ github.event.inputs.buildType }}" == "release" ]; then
+            ./gradlew assembleRelease
+          else
+            ./gradlew assembleDebug
+          fi
+
+      # Upload APK artifact (optional)
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ github.event.inputs.buildType }}-apk
+          path: app/build/outputs/apk/${{ github.event.inputs.buildType }}/*.apk
+
+
