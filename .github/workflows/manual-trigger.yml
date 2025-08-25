@@ -1,5 +1,5 @@
 # .github/workflows/manual-trigger.yml
-name: Manual Android (full-inputs demo)
+name: Manual Android Trigger
 
 on:
   workflow_dispatch:
