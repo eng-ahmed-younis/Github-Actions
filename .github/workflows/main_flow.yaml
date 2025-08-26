@@ -32,7 +32,7 @@ jobs:
         uses: actions/setup-java@v5.0.0
         with:
           distribution: temurin
-          java-version: "${{JAVA_VERSION }}"
+          java-version: ${{ env.JAVA_VERSION }}
           cache: gradle
 
       # (Optional but recommended) Validate Gradle wrapper
