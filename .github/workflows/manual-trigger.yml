@@ -25,8 +25,7 @@ jobs:
 
     env:
       # Java/Gradle
-      JAVA_VERSION: "17"
-      # App / Fastlane env consumed by your Fastfile
+      JAVA_VERSION: ${{}{ vars.JAVA_VERSION || '17' }}
       APP_NAME: ${{ vars.APP_NAME || 'SuperShiftCustomer' }}
       PACKAGE_NAME: ${{ vars.PACKAGE_NAME || 'com.innovitics.app.shift' }}
       FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
